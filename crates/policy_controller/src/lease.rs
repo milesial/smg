@@ -143,8 +143,9 @@ pub enum Membership<'a> {
     /// registration: its role moved, or it serves them no longer. Said
     /// ahead of the [`Membership::Relabelled`] or [`Membership::Resized`]
     /// of the same write. A stage that lists workers by model unlists the
-    /// worker under these alone. The plugin contracts carry no such kind: a
-    /// plugin is told nothing of it.
+    /// worker under these alone. Both plugin contracts carry the word: the
+    /// guest's world as the case `left`, the remote one as a kind a stream
+    /// of protocol 2 is sent.
     Left {
         id: WorkerId,
         models: &'a [String],
