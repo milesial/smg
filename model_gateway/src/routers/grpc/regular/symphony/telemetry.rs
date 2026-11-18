@@ -534,8 +534,8 @@ impl Tally {
         self.at += bytes_of(event);
     }
 
-    /// Accounts for `event` of a call the request's `tool_choice` forbade, or of an output with
-    /// no call kept (every event of an output under `none`): the reader drops the call after
+    /// Accounts for `event` of a call the request's `tool_choice` forbade, or for the finish of
+    /// an output with no call kept: the reader drops the call after
     /// this tally sees it (`event::forbidden_calls`), so a call's bytes count as dropped, not
     /// shown, it begins no call the client sees and names no undeclared function to it (the
     /// `UnknownTool` event announcing its name goes with it), each is counted as forbidden, none

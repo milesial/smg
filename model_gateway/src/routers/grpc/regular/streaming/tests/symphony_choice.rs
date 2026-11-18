@@ -511,25 +511,28 @@ fn message_spec_of(family: &Family, tools: &[&str], choice: Value) -> MessagesRe
     spec
 }
 
-/// The tools a streamed message of `output` used under `spec`, each by name with its input, and
-/// the message's stop reason.
-async fn message_said(spec: MessagesResponseSpec, output: &str) -> (Vec<(String, Value)>, String) {
+/// A content block as a test reads it: its type, its text or its tool's name, and the tool's
+/// input.
+type Block = (String, String, Value);
+
+/// The content blocks of a streamed message of `output` under `spec`, every one but a thought,
+/// and the message's stop reason.
+async fn message_said(spec: MessagesResponseSpec, output: &str) -> (Vec<Block>, String) {
     let (result, events) = message_events(by_character(output), spec, None).await;
     assert!(result.is_ok(), "{result:?}");
-    let tools = message_blocks(&events)
+    let blocks = message_blocks(&events)
         .into_iter()
-        .filter(|(kind, _, _)| kind == "tool_use")
-        .map(|(_, name, input)| (name, input))
+        .filter(|(kind, _, _)| kind != "thinking")
         .collect();
     let stop = events
         .iter()
         .find_map(|event| event["delta"]["stop_reason"].as_str())
         .expect("a stop reason");
-    (tools, stop.to_string())
+    (blocks, stop.to_string())
 }
 
-/// The content blocks of the whole message of `output` under `spec`, as their debug text.
-async fn whole_message(spec: MessagesResponseSpec, output: &str) -> String {
+/// The content blocks of the whole message of `output` under `spec`, every one but a thought.
+async fn whole_message(spec: MessagesResponseSpec, output: &str) -> Vec<Block> {
     let mut frame = complete(0, "stop");
     if let Some(proto::generate_response::Response::Complete(done)) = &mut frame.response {
         done.output_ids = output.chars().map(u32::from).collect();
@@ -556,7 +559,21 @@ async fn whole_message(spec: MessagesResponseSpec, output: &str) -> String {
     .await;
     server.abort();
     match result {
-        Ok((message, _)) => format!("{:?}", message.content),
+        Ok((message, _)) => serde_json::to_value(&message.content)
+            .expect("the content blocks")
+            .as_array()
+            .expect("a list of blocks")
+            .iter()
+            .filter(|block| block["type"] != "thinking")
+            .map(|block| {
+                let named = block["name"].as_str().or_else(|| block["text"].as_str());
+                (
+                    block["type"].as_str().unwrap_or_default().to_string(),
+                    named.unwrap_or_default().to_string(),
+                    block["input"].clone(),
+                )
+            })
+            .collect(),
         Err(response) => panic!("a message, not the status {}", response.status()),
     }
 }
@@ -572,17 +589,16 @@ async fn a_message_returns_the_tool_its_choice_names_alone() {
             )
         };
         let output = (family.write)(&[SAVE_NOTE, DELETE_FILE]);
-        let (tools, stop) = message_said(spec(), &output).await;
+        let (blocks, stop) = message_said(spec(), &output).await;
         let table = table_of(family);
-        assert_eq!(
-            tools,
-            [("save_note".to_string(), json!({"text": "t"}))],
-            "{table}"
-        );
+        let want = [(
+            "tool_use".to_string(),
+            "save_note".to_string(),
+            json!({"text": "t"}),
+        )];
+        assert_eq!(blocks, want, "{table}");
         assert_eq!(stop, "tool_use", "{table}");
-        let blocks = whole_message(spec(), &output).await;
-        assert!(blocks.contains("save_note"), "{table}: {blocks}");
-        assert!(!blocks.contains("delete_file"), "{table}: {blocks}");
+        assert_eq!(whole_message(spec(), &output).await, want, "{table}");
     }
 }
 
@@ -593,11 +609,69 @@ async fn a_message_under_any_returns_no_tool_the_request_did_not_declare() {
     for family in &FAMILIES {
         let spec = || message_spec_of(family, &["save_note"], json!({"type": "any"}));
         let output = (family.write)(&[DELETE_FILE]);
-        let (tools, stop) = message_said(spec(), &output).await;
+        let (blocks, stop) = message_said(spec(), &output).await;
         let table = table_of(family);
-        assert_eq!(tools, [], "{table}");
+        assert_eq!(blocks, [], "{table}");
         assert_eq!(stop, "end_turn", "{table}");
-        let blocks = whole_message(spec(), &output).await;
-        assert!(!blocks.contains("delete_file"), "{table}: {blocks}");
+        assert_eq!(whole_message(spec(), &output).await, [], "{table}");
     }
+}
+
+/// A call to `delete_file` as the table of JSON objects reads it, whose object the output never
+/// closes: a member stands behind its arguments.
+const OPEN_CALL: &str =
+    "<tool_call>\n{\"name\": \"delete_file\", \"arguments\": {\"path\": \"/\"}, \"note\": \"n\"";
+
+/// A whole call to `lookup` as that table reads it.
+const WHOLE_CALL: &str =
+    "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"text\": \"q\"}}\n</tool_call>";
+
+/// Under `choice`, and with one call only unless `parallel`, `output` of the table of JSON
+/// objects is said as `calls` and no text beside them, whole and at every cut.
+async fn assert_objects_said(
+    choice: Option<Value>,
+    parallel: bool,
+    output: &str,
+    calls: &[Call],
+    finish: &str,
+) {
+    let family = Family {
+        format: || Table::Qwen3.shared(),
+        prompt: "",
+        write: tagged_calls,
+    };
+    let spec = chat_spec_of(&family, &["lookup", "delete_file"], choice, parallel);
+    for (way, said) in every_way(&spec, output).await {
+        assert_said(&said, calls, finish, &format!("{way} of {output:?}"));
+    }
+}
+
+/// A call the choice leaves out whose object the output never closes: the bytes behind its
+/// arguments go with the call, so the client is sent no call and no text, and a call the choice
+/// allows after it is returned alone.
+#[tokio::test]
+async fn a_call_the_choice_leaves_out_that_never_closes_returns_no_text() {
+    let then = format!("{OPEN_CALL}\n</tool_call>\n{WHOLE_CALL}");
+    for choice in [named("lookup"), allowed("auto", &["lookup"])] {
+        assert_objects_said(Some(choice.clone()), true, OPEN_CALL, &[], "stop").await;
+        assert_objects_said(Some(choice), true, &then, &[LOOKUP], "tool_calls").await;
+    }
+}
+
+/// Under `none` a call whose object the output never closes returns no call and no text.
+#[tokio::test]
+async fn a_call_under_none_that_never_closes_returns_no_text() {
+    let then = format!("{OPEN_CALL}\n</tool_call>\n{WHOLE_CALL}");
+    assert_objects_said(Some(json!("none")), true, OPEN_CALL, &[], "stop").await;
+    assert_objects_said(Some(json!("none")), true, &then, &[], "stop").await;
+}
+
+/// Where the request takes one call, a later call whose object the output never closes returns
+/// no text beside the first call.
+#[tokio::test]
+async fn a_later_call_that_never_closes_returns_no_text() {
+    let after = format!("{WHOLE_CALL}\n{OPEN_CALL}");
+    let closed = format!("{after}\n</tool_call>");
+    assert_objects_said(None, false, &after, &[LOOKUP], "tool_calls").await;
+    assert_objects_said(None, false, &closed, &[LOOKUP], "tool_calls").await;
 }

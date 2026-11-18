@@ -1120,8 +1120,7 @@ struct ForbiddenCalls {
     /// forbids none and whose steps the reader tallies itself ([`Reader::feed`]).
     any: bool,
     forbids: Forbids,
-    /// Under a choice that forbids some calls and not others: the engine's index of the call
-    /// being dropped.
+    /// The engine's index of the call being dropped, from its start to its end.
     dropping: Option<u32>,
     /// How many calls were dropped so far, by which a call kept after them moves down.
     dropped: u32,
@@ -1130,26 +1129,21 @@ struct ForbiddenCalls {
 impl ForbiddenCalls {
     /// For a step under a choice that forbids calls ([`Self::any`]; a step under `auto` the reader
     /// tallies itself): tells `seen` of each of the step's `fresh` events, with whether the choice
-    /// forbids it (under `none`, where no call is kept, every event of the output), then rewrites
-    /// a forbidden call's events as dropped text (`event::forbidden_calls`): never a call or
-    /// content. Under a choice that forbids some calls and not others a call is asked once, at
-    /// its start ([`Forbids::call_to`]): by its function's name and by the engine's word on
-    /// whether the request declares it, the `Malformed { UnknownTool }` event of no bytes right
-    /// before the start, which goes with the call it announces. The call's later events follow
-    /// that answer by their index, so no name is compared on a delta. A table reads one call at
-    /// a time, so a call kept after a dropped one moves down by the count dropped before it, and
-    /// the calls delivered are numbered from zero; the finish counts the calls kept, and with
-    /// none kept it is forbidden too: a `tool_calls` finish is the engine's `stop` again.
+    /// forbids it, then rewrites a forbidden call's events as dropped text
+    /// (`event::forbidden_calls`): never a call or content. A call is asked once, at its start
+    /// ([`Forbids::call_to`]): by its function's name and by the engine's word on whether the
+    /// request declares it, the `Malformed { UnknownTool }` event of no bytes right before the
+    /// start, which goes with the call it announces. The call's later events follow that answer
+    /// by their index, so no name is compared on a delta, and text the table could not read
+    /// inside a dropped call (the bytes behind the arguments of an object the output never
+    /// closed) is dropped with it. A table reads one call at a time, so a call kept after a
+    /// dropped one moves down by the count dropped before it, and the calls delivered are
+    /// numbered from zero; the finish counts the calls kept, and with none kept it is forbidden
+    /// too: a `tool_calls` finish is the engine's `stop` again.
     fn drop_from(&mut self, fresh: &mut [Event<'_>], mut seen: impl FnMut(&Event<'_>, bool)) {
         match self.forbids {
             Forbids::Nothing => {}
-            Forbids::Every => {
-                for event in fresh.iter() {
-                    seen(event, true);
-                }
-                symphony::event::forbidden_calls(fresh);
-            }
-            Forbids::Undeclared | Forbids::AllBut(_) => {
+            Forbids::Every | Forbids::Undeclared | Forbids::AllBut(_) => {
                 let mut undeclared = false;
                 for event in fresh {
                     let announced = std::mem::take(&mut undeclared);
@@ -1173,10 +1167,27 @@ impl ForbiddenCalls {
                             }
                             forbidden
                         }
-                        Event::ToolCallArguments { index, .. }
-                        | Event::ToolCallEnd { index, .. } => {
+                        // Text the table could not read inside the call being dropped is that
+                        // call's: it goes with it, as dropped text.
+                        Event::Malformed { text, .. } if self.dropping.is_some() => {
+                            *event = Event::Dropped {
+                                text: std::mem::take(text),
+                                why: DropReason::ForbiddenCall,
+                            };
+                            false
+                        }
+                        Event::ToolCallArguments { index, .. } => {
                             let forbidden = self.dropping == Some(*index);
                             if !forbidden {
+                                *index -= self.dropped;
+                            }
+                            forbidden
+                        }
+                        Event::ToolCallEnd { index, .. } => {
+                            let forbidden = self.dropping == Some(*index);
+                            if forbidden {
+                                self.dropping = None;
+                            } else {
                                 *index -= self.dropped;
                             }
                             forbidden
