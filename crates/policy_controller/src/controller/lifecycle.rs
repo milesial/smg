@@ -28,6 +28,13 @@
 //! generation's own, what became of the decision: its dispatch, its
 //! completion or its release. A generation that no longer stands is told
 //! nothing: the stages of a later one never saw the issue.
+//!
+//! A pair's lease is one record under one id with a part a side, and a
+//! frame moves the side it names: the engine is told of that side alone,
+//! with that side's lease and on that side's worker, and a `Released`
+//! that names no side tells every side that stood. A frame on a side the
+//! pair's lease does not hold, or on a side that ended, writes nothing
+//! and tells nothing. A single's lease reads no side.
 
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
@@ -132,6 +139,11 @@ pub(crate) fn tells(store: &MemoryStore) {
 /// names that index: the record was read before the door wrote it. A
 /// frame that names no target of the pick tells nothing.
 ///
+/// A pair's lease is told by side: a dispatch on the side its frame names,
+/// with that side's lease and on that side's worker, and an end once a
+/// side the record held live, the frame's side or with none every side
+/// ([`LeaseRecord::ending`]).
+///
 /// Its caller is whoever applies the frame, under the turn of the leases'
 /// file: what it calls is bounded and takes no door of the leases. It
 /// enters as the decider whose file the lease is on, on whichever thread
@@ -169,7 +181,13 @@ fn tell(store: &MemoryStore, record: &LeaseRecord, said: Said) {
         let engine = (spec.generation() == record.lease.generation).then(|| spec.engine());
         match (said, engine) {
             (Said::Dispatched(dispatch, at), engine) => {
-                let Some((id, dp_rank)) = record.target_at(dispatch.target_index) else {
+                // The side the frame names: its lease, and its worker at
+                // the index the frame names.
+                let Some((lease, _)) = record.side(dispatch.side) else {
+                    return;
+                };
+                let named = record.target_of(dispatch.side, dispatch.target_index);
+                let Some((id, dp_rank)) = named else {
                     return;
                 };
                 let target = Target {
@@ -182,7 +200,7 @@ fn tell(store: &MemoryStore, record: &LeaseRecord, said: Said) {
                 // the index off the lease.
                 let lease = Lease {
                     target_index: dispatch.target_index,
-                    ..record.lease
+                    ..lease
                 };
                 // The table hears first and the pin of record reads it.
                 // The stages hear last, so nothing is held across their
@@ -191,7 +209,7 @@ fn tell(store: &MemoryStore, record: &LeaseRecord, said: Said) {
                 if let Some(engine) = engine {
                     engine.dispatched_key(&lease, &target, dispatch.side);
                 }
-                pinned(store, record, engine, id, at);
+                pinned(store, &lease, record.session_ttl_micros, engine, id, at);
                 if let Some(engine) = engine {
                     engine.dispatched_stages(
                         &lease,
@@ -202,9 +220,15 @@ fn tell(store: &MemoryStore, record: &LeaseRecord, said: Said) {
                 }
             }
             (Said::Completed(outcome), Some(engine)) => {
-                engine.on_completed(&record.lease, &outcome);
+                for lease in record.ending(Some(outcome.side)).iter().flatten() {
+                    engine.on_completed(lease, &outcome);
+                }
             }
-            (Said::Released(_, reason), Some(engine)) => engine.on_released(&record.lease, reason),
+            (Said::Released(side, reason), Some(engine)) => {
+                for lease in record.ending(side).iter().flatten() {
+                    engine.on_released(lease, reason);
+                }
+            }
             (Said::Completed(_) | Said::Released(..), None) => {}
         }
     });
@@ -231,12 +255,12 @@ fn tell(store: &MemoryStore, record: &LeaseRecord, said: Said) {
 /// store's pin is written: no lock is held across the two.
 fn pinned(
     store: &MemoryStore,
-    record: &LeaseRecord,
+    lease: &Lease,
+    ttl_micros: Option<u64>,
     engine: Option<&Engine>,
     dispatched: WorkerId,
     at: Instant,
 ) {
-    let lease = &record.lease;
     if lease.session == Session::NONE || lease.session_verdict == SessionVerdict::None {
         return;
     }
@@ -255,9 +279,7 @@ fn pinned(
         // The lease's own rule is the word of a decision that may be older
         // than the pin's last writer: it never moves the end earlier.
         Some((_, Forgets::Unread)) | None => {
-            let ends = record
-                .session_ttl_micros
-                .map(|ttl| lease.issued_micros.saturating_add(ttl));
+            let ends = ttl_micros.map(|ttl| lease.issued_micros.saturating_add(ttl));
             SessionsStore::pin_no_earlier(store, key, worker, at, ends);
         }
     }
@@ -389,7 +411,7 @@ pub(crate) mod tests {
         builtins::Random,
         catalog::Catalog,
         controller::gateways::tests::lease,
-        decision::{Target, Targets},
+        decision::{Pair, Target, Targets},
         framework::{Picker, TieBand},
         lease::{Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
         proto::{
@@ -400,8 +422,8 @@ pub(crate) mod tests {
         sessions::{SessionRule, SessionVerdict},
         spec::{AppliedSpec, Assignment, PolicySpec, Recovery},
         store::{
-            Dispatch, GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore, Picked,
-            SessionsStore, WorkerFacts, WorkersStore,
+            DecodeSide, Dispatch, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore,
+            MemoryStore, Picked, SessionsStore, WorkerFacts, WorkersStore,
         },
         view::{Candidate, Health, Phase, RequestFacts, Session, WorkerId},
         Constraints, PoolFacts, Scratch,
@@ -466,7 +488,8 @@ pub(crate) mod tests {
     }
 
     /// What the engine told a stage of leases: the call, the lease's id and
-    /// the worker the call named.
+    /// the worker the call named. A release names no worker: a pair's is
+    /// kept by its side.
     type Heard = Vec<(&'static str, u64, WorkerId)>;
 
     /// The index each dispatch's lease named and the rank of the target it
@@ -490,7 +513,12 @@ pub(crate) mod tests {
         }
 
         fn on_released(&self, lease: &Lease, _: ReleaseReason) {
-            self.0.lock().push(("released", lease.id.0, WorkerId(0)));
+            let call = match lease.side {
+                Side::Prefill => "released prefill",
+                Side::Decode => "released decode",
+                _ => "released",
+            };
+            self.0.lock().push((call, lease.id.0, WorkerId(0)));
             assert_ne!(lease.id.0, BURSTS, "the stage's call panics");
         }
     }
@@ -609,6 +637,97 @@ pub(crate) mod tests {
         released(&store, &open(&store, A), &a_released(1)).expect("the frame reads");
         released(&store, &open(&store, A), &a_released(1)).expect("no error");
         assert_eq!(heard.lock()[1..], [("released", 1, WorkerId(0))]);
+    }
+
+    /// A pair's lease is one record with a part a side: the engine is told
+    /// of each side once, by that side's own frame and on that side's
+    /// worker.
+    #[test]
+    fn a_pairs_frames_tell_the_engine_once_a_side_on_that_sides_worker() {
+        let store = MemoryStore::new();
+        let [p, d0, d1] = ["p", "d0", "d1"].map(|key| worker(&store, key));
+        let heard = hearing(&store, 1);
+        let now = Instant::now();
+        let mut targets = Targets::new();
+        for decode_id in [d0, d1] {
+            let pair = Pair {
+                decode_id,
+                ..Pair::default()
+            };
+            targets.push(Target {
+                id: p,
+                pair: Some(pair),
+                ..Target::default()
+            });
+        }
+        let pair = |id: u64| LeaseRecord {
+            lease: Lease {
+                id: LeaseId(id),
+                side: Side::Prefill,
+                generation: 1,
+                ..Lease::default()
+            },
+            gateway: A,
+            request: id,
+            target: p,
+            picked: Picked::of(&targets),
+            decode: Some(DecodeSide {
+                target: d0,
+                picked: Picked::of_decodes(&targets),
+                session: Session::NONE,
+                state: LeaseState::Issued,
+                tokens: 0,
+                target_index: 0,
+            }),
+            term: 0,
+            issued_at: now,
+            dispatch_deadline: now + Duration::from_secs(5),
+            state: LeaseState::Issued,
+            session_ttl_micros: None,
+        };
+        LeasesStore::issue(&store, pair(1)).expect("the key is free");
+        let frame = |side: proto::Side, index: u32| proto::Dispatched {
+            side: side.into(),
+            target_index: index,
+            ..a_dispatched(1)
+        };
+        // The decode's dispatch on the alternate is told on that decode,
+        // the prefill's on the prefill. A second dispatch of a side and a
+        // frame on a side the pair does not hold tell nothing.
+        for (side, index) in [
+            (proto::Side::Decode, 1),
+            (proto::Side::Prefill, 0),
+            (proto::Side::Decode, 0),
+            (proto::Side::Single, 0),
+        ] {
+            dispatched(&store, &open(&store, A), &frame(side, index), now)
+                .expect("the frame reads");
+        }
+        assert_eq!(*heard.lock(), [("dispatched", 1, d1), ("dispatched", 1, p)]);
+        // A side's completion is told once, and the other side stands.
+        let ended = |side: proto::Side, served: WorkerId| proto::Completed {
+            side: side.into(),
+            ..a_completed(1, served)
+        };
+        for _ in 0..2 {
+            completed(
+                &store,
+                &open(&store, A),
+                &ended(proto::Side::Prefill, p),
+                now,
+            )
+            .expect("the frame reads");
+        }
+        assert_eq!(heard.lock()[2..], [("completed", 1, p)]);
+        // A release with no side ends what stands: the decode alone.
+        released(&store, &open(&store, A), &a_released(1)).expect("the frame reads");
+        assert_eq!(heard.lock()[3..], [("released decode", 1, WorkerId(0))]);
+        assert_eq!(LeasesStore::get(&store, A, LeaseId(1)), None);
+        // A pair given up whole is told once a side.
+        LeasesStore::issue(&store, pair(2)).expect("the key is free");
+        released(&store, &open(&store, A), &a_released(2)).expect("the frame reads");
+        let whole = ["released prefill", "released decode"].map(|call| (call, 2, WorkerId(0)));
+        assert_eq!(heard.lock()[4..], whole);
     }
 
     #[test]
